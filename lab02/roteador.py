@@ -5,7 +5,8 @@ import json
 import threading
 import time
 from argparse import ArgumentParser
-
+import copy
+import ipaddress
 import requests
 from flask import Flask, jsonify, request
 
@@ -23,14 +24,14 @@ class Router:
                           Ex: {'127.0.0.1:5001': 5, '127.0.0.1:5002': 10}
         :param my_network: A rede que este roteador administra diretamente.
                            Ex: '10.0.1.0/24'
-        :param update_interval: O intervalo em segundos para enviar atualizações, o tempo que o roteador espera 
+        :param update_interval: O intervalo em segundos para enviar atualizações, o tempo que o roteador espera
                                 antes de enviar atualizações para os vizinhos.        """
         self.my_address = my_address
         self.neighbors = neighbors
         self.my_network = my_network
         self.update_interval = update_interval
 
-        # TODO: Este é o local para criar e inicializar sua tabela de roteamento.
+        # TODO: Este é o local para criar e inicializar sua tabela de roteamento. ✔
         #
         # 1. Crie a estrutura de dados para a tabela de roteamento. Um dicionário é
         #    uma ótima escolha, onde as chaves são as redes de destino (ex: '10.0.1.0/24')
@@ -44,7 +45,30 @@ class Router:
         # 3. Adicione as rotas para seus vizinhos diretos, usando o dicionário
         #    'self.neighbors'. Para cada vizinho, o 'cost' é o custo do link direto
         #    e o 'next_hop' é o endereço do próprio vizinho.
+
+        # 1️⃣ Cria a estrutura da tabela de roteamento
+        # Formato:
+        # {
+        #   'rede_destino': {
+        #       'cost': valor,
+        #       'next_hop': endereco
+        #   }
+        # }
+
         self.routing_table = {}
+
+        # 2️⃣ Adiciona a rota da própria rede (diretamente conectada)
+        self.routing_table[self.my_network] = {
+            'cost': 0,
+            'next_hop': self.my_address
+        }
+
+        # 3️⃣ Adiciona rotas para vizinhos diretos
+        for neighbor, cost in self.neighbors.items():
+            self.routing_table[neighbor] = {
+                'cost': cost,
+                'next_hop': neighbor
+            }
 
         print("Tabela de roteamento inicial:")
         print(json.dumps(self.routing_table, indent=4))
@@ -72,7 +96,7 @@ class Router:
         """
         Envia a tabela de roteamento (potencialmente sumarizada) para todos os vizinhos.
         """
-        # TODO: O código abaixo envia a tabela de roteamento *diretamente*.
+        # TODO: O código abaixo envia a tabela de roteamento *diretamente*. ✔
         #
         # ESTE TRECHO DEVE SER CHAMAADO APOS A SUMARIZAÇÃO.
         #
@@ -80,22 +104,86 @@ class Router:
         # 1. CRIE UMA CÓPIA da `self.routing_table` NÃO ALTERE ESTA VALOR.
         # 2. IMPLEMENTE A LÓGICA DE SUMARIZAÇÃO nesta cópia.
         # 3. ENVIE A CÓPIA SUMARIZADA no payload, em vez da tabela original.
-        
-        tabela_para_enviar = self.routing_table # ATENÇÃO: Substitua pela cópia sumarizada.
 
-        payload = {
-            "sender_address": self.my_address,
-            "routing_table": tabela_para_enviar
-        }
+        INFINITY = 16
 
         for neighbor_address in self.neighbors:
+
+            # 1️⃣ cria cópia
+            tabela_para_enviar = copy.deepcopy(self.routing_table)
+
+            # Desafio: aplica sumarização na cópia
+            tabela_para_enviar = self.summarize_table(tabela_para_enviar)
+
+            # 2️⃣ aplica poison reverse
+            for destino, info in tabela_para_enviar.items():
+                if info['next_hop'] == neighbor_address:
+                    info['cost'] = INFINITY
+
+            payload = {
+                "sender_address": self.my_address,
+                "routing_table": tabela_para_enviar
+            }
+
             url = f'http://{neighbor_address}/receive_update'
+
             try:
                 print(f"Enviando tabela para {neighbor_address}")
                 requests.post(url, json=payload, timeout=5)
             except requests.exceptions.RequestException as e:
                 print(f"Não foi possível conectar ao vizinho {neighbor_address}. Erro: {e}")
 
+    def summarize_table(self, table):
+        """
+        Recebe uma tabela de roteamento e retorna uma nova tabela sumarizada,
+        preservando custos e next_hop.
+        """
+
+
+        # Converte redes para objetos IP
+        redes_obj = {}
+        for net, info in table.items():
+            try:
+                redes_obj[ipaddress.ip_network(net, strict=False)] = info
+            except ValueError:
+                continue
+
+        # Faz a sumarização automática
+        summarized = list(ipaddress.collapse_addresses(redes_obj.keys()))
+
+        nova_tabela = {}
+
+        for sum_net in summarized:
+
+            # Encontra redes originais contidas nessa sumarização
+            redes_contidas = [
+                net for net in redes_obj
+                if net.subnet_of(sum_net)
+            ]
+
+            if not redes_contidas:
+                continue
+
+            # Usa o menor custo das redes agrupadas
+            menor_custo = min(redes_obj[net]['cost'] for net in redes_contidas)
+
+            # Usa o next_hop da rede com menor custo
+            melhor_rede = min(
+                redes_contidas,
+                key=lambda n: redes_obj[n]['cost']
+            )
+
+            nova_tabela[str(sum_net)] = {
+                "cost": menor_custo,
+                "next_hop": redes_obj[melhor_rede]['next_hop']
+            }
+
+        return nova_tabela
+
+
+
+
+        # aqui você envia o update_packet via request.post
 # --- API Endpoints ---
 # Instância do Flask e do Roteador (serão inicializadas no main)
 app = Flask(__name__)
@@ -109,7 +197,7 @@ def get_routes():
     # - mantenha o routing_table como parte da resposta JSON.
     if router_instance:
         return jsonify({
-            "message": "Não implementado!.",
+            "message": "Tabela de roteamento atual",
             "vizinhos" : router_instance.neighbors,
             "my_network": router_instance.my_network,
             "my_address": router_instance.my_address,
@@ -134,7 +222,7 @@ def receive_update():
     print(f"Recebida atualização de {sender_address}:")
     print(json.dumps(sender_table, indent=4))
 
-    # TODO: Implemente a lógica de Bellman-Ford aqui.
+    # TODO: Implemente a lógica de Bellman-Ford aqui. ✔
     #
     # 1. Verifique se o remetente é um vizinho conhecido.
     # 2. Obtenha o custo do link direto para este vizinho a partir de `router_instance.neighbors`.
@@ -153,6 +241,60 @@ def receive_update():
     #
     # 6. Mantenha um registro se sua tabela mudou ou não. Se mudou, talvez seja
     #    uma boa ideia imprimir a nova tabela no console.
+
+    INFINITY = 16
+
+    # 1️⃣ Verifica se o remetente é vizinho conhecido
+    if sender_address not in router_instance.neighbors:
+        print(f"Ignorando atualização de {sender_address} (não é vizinho).")
+        return jsonify({"status": "ignored"}), 200
+
+    # 2️⃣ Obtém custo do link direto
+    custo_link = router_instance.neighbors[sender_address]
+
+    tabela_mudou = False
+
+    # 3️⃣ Itera sobre rotas recebidas
+    for network, info in sender_table.items():
+
+        custo_recebido = info.get("cost", INFINITY)
+
+        # 4️⃣ Calcula novo custo
+        novo_custo = custo_link + custo_recebido
+
+        # Evita overflow artificial
+        if novo_custo > INFINITY:
+            novo_custo = INFINITY
+
+        # 5️⃣ Verifica tabela local
+        if network not in router_instance.routing_table:
+            # 5a - não conhecia a rota
+            router_instance.routing_table[network] = {
+                "cost": novo_custo,
+                "next_hop": sender_address
+            }
+            tabela_mudou = True
+
+        else:
+            custo_atual = router_instance.routing_table[network]["cost"]
+            next_hop_atual = router_instance.routing_table[network]["next_hop"]
+
+            # 5b - encontrou rota melhor
+            if novo_custo < custo_atual:
+                router_instance.routing_table[network] = {
+                    "cost": novo_custo,
+                    "next_hop": sender_address
+                }
+                tabela_mudou = True
+
+            # 5c - se a rota atual usa esse vizinho, sempre atualiza
+            elif next_hop_atual == sender_address:
+                router_instance.routing_table[network]["cost"] = novo_custo
+                tabela_mudou = True
+    if tabela_mudou:
+        print("Tabela de roteamento atualizada:")
+        print(json.dumps(router_instance.routing_table, indent=4))
+
 
     return jsonify({"status": "success", "message": "Update received"}), 200
 
